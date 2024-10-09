@@ -1,0 +1,109 @@
+
+import feedparser
+import hashlib
+import logging
+from celery import Celery
+from sqlalchemy import create_engine, Column, String, Date, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import spacy
+from datetime import datetime
+
+# Setup Logging
+logging.basicConfig(filename='app.log', level=logging.INFO)
+
+# RSS Feeds
+feeds = [
+    "http://rss.cnn.com/rss/cnn_topstories.rss",
+    "http://qz.com/feed",
+    "http://feeds.foxnews.com/foxnews/politics",
+    "http://feeds.reuters.com/reuters/businessNews",
+    "http://feeds.feedburner.com/NewshourWorld",
+    "https://feeds.bbci.co.uk/news/world/asia/india/rss.xml"
+]
+
+# Initialize SpaCy NLP model
+nlp = spacy.load("en_core_web_sm")
+
+# Celery Configuration
+app = Celery('tasks', broker='redis://localhost:6379/0')
+
+# Database Setup
+Base = declarative_base()
+
+class Article(Base):
+    __tablename__ = 'articles'
+    id = Column(String, primary_key=True)
+    title = Column(String)
+    content = Column(Text)
+    published = Column(Date)
+    url = Column(String)
+    category = Column(String)
+
+# Database connection
+engine = create_engine('postgresql://user:password@localhost/dbname')
+Session = sessionmaker(bind=engine)
+session = Session()
+
+# Function to Fetch and Parse RSS Feeds
+def fetch_articles(feed_url):
+    try:
+        feed = feedparser.parse(feed_url)
+        articles = []
+        for entry in feed.entries:
+            article_id = hashlib.md5(entry.title.encode()).hexdigest()  # Handle duplicates by using hash of title
+            published_date = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %Z')
+            articles.append({
+                'id': article_id,
+                'title': entry.title,
+                'link': entry.link,
+                'published': published_date,
+                'content': entry.summary
+            })
+        return articles
+    except Exception as e:
+        logging.error(f"Error fetching {feed_url}: {str(e)}")
+        return []
+
+# Function to Store Articles in Database
+def store_articles(articles):
+    try:
+        for article in articles:
+            if not session.query(Article).filter_by(id=article['id']).first():
+                new_article = Article(**article)
+                session.add(new_article)
+        session.commit()
+    except Exception as e:
+        logging.error(f"Error storing articles: {str(e)}")
+
+# Celery Task to Classify and Store Articles
+@app.task
+def categorize_and_store_articles(articles):
+    for article in articles:
+        article['category'] = classify_article(article['content'])
+        store_articles([article])
+
+# Function to Classify Article Content using NLP
+def classify_article(content):
+    doc = nlp(content)
+    # Simple rule-based classification
+    if any(token.lemma_ in ['terrorism', 'protest', 'riot', 'unrest'] for token in doc):
+        return 'Terrorism/Protest/Political unrest/Riot'
+    elif any(token.lemma_ in ['disaster', 'earthquake', 'flood', 'hurricane'] for token in doc):
+        return 'Natural Disasters'
+    elif any(token.lemma_ in ['positive', 'uplifting', 'good', 'happy'] for token in doc):
+        return 'Positive/Uplifting'
+    else:
+        return 'Others'
+
+# Main function to run the entire pipeline
+def run_pipeline():
+    all_articles = []
+    for feed_url in feeds:
+        articles = fetch_articles(feed_url)
+        all_articles.extend(articles)
+    
+    categorize_and_store_articles.delay(all_articles)
+
+if __name__ == "__main__":
+    run_pipeline()
